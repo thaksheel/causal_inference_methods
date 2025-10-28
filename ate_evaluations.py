@@ -4,7 +4,7 @@ from matplotlib import pyplot as plt
 from dataclasses import dataclass, asdict
 from typing import Dict, List, Literal, Optional
 from sklearn.linear_model import LinearRegression, LogisticRegression
-from sklearn.preprocessing import StandardScaler, MinMaxScaler
+from sklearn.neighbors import NearestNeighbors
 from sklearn.ensemble import RandomForestRegressor
 import doubleml as dml
 from statsmodels.api import WLS, add_constant
@@ -27,15 +27,17 @@ class ATEEvaluations:
         self,
         seed,
         outcome_type: Literal["binary", "continuous"],
-        data: Optional[pd.DataFrame] = None,
+        data: Optional[CausalSetUp] = None,
     ):
         self.outcome_type = outcome_type
-        if data is not None:
-            self.data = data
+        self.data = data if data is not None else None
         self.seed = seed
-        self.synth_data: CausalSetUp = None
-        self.known_confounders_coef = None
+        self.synth_data: CausalSetUp = None 
+        self.known_confounders_coef = None 
         self.known_effect = None
+        self.num_confounders: int = (
+            None if self.data is None else len(data.confounders.T)
+        )
 
     def data_to_df(self, data: Optional[CausalSetUp] = None):
         if data is None or isinstance(data, CausalSetUp):
@@ -60,13 +62,24 @@ class ATEEvaluations:
     def dml(
         self,
         data: CausalSetUp,
-        model1=RandomForestRegressor(),
-        model2=RandomForestRegressor(),
+        model1=None,
+        model2=None,
+        model3=None,
     ):
+        learner = RandomForestRegressor(
+            n_estimators=100,
+            max_features=self.num_confounders,
+            max_depth=5,
+            min_samples_leaf=2,
+        )
+        model1 = learner if model1 is None else model1
+        model2 = learner if model2 is None else model2
+        model3 = learner if model3 is None else model3
         dml_data = dml.DoubleMLData.from_arrays(
             data.confounders, data.outcome, data.treatment
         )
-        dml_model = dml.DoubleMLPLR(dml_data, model1, model2)
+        dml_model = dml.DoubleMLPLR(dml_data, model1, model2, n_folds=5, n_rep=5)
+        # dml_model = dml.DoubleMLPLR(dml_data, model1, model2, model3, n_folds=3, score="IV-type", n_rep=5)
         dml_model.fit(n_jobs_cv=10)
         return dml_model.coef[0], dml_model.se[0], dml_model.pval[0]
 
@@ -89,20 +102,48 @@ class ATEEvaluations:
         model = WLS(data.outcome, X_ipw, weights=weights).fit()
         return model.params[-1], model.bse[-1], model.pvalues[-1]
 
+    def propensity_score2(self, data: CausalSetUp):
+        df = self.data_to_df(data)
+        X = df.drop(columns=["outcome", "treatment", "index"])
+        y = df["treatment"]
+        model = LogisticRegression(solver="lbfgs", max_iter=1000)
+        model.fit(X, y)
+        df["propensity_score"] = model.predict_proba(X)[:, 1]
+        treated = df[df["treatment"] == 1].copy()
+        control = df[df["treatment"] == 0].copy()
+        nn = NearestNeighbors(n_neighbors=1, algorithm="ball_tree")
+        nn.fit(control[["propensity_score"]])
+        distances, indices = nn.kneighbors(treated[["propensity_score"]])
+        treated["matched_ID"] = control.iloc[indices.flatten()]["index"].values
+        treated["outcome_untreated"] = control.iloc[indices.flatten()]["outcome"].values
+        diff = treated["outcome"] - treated["outcome_untreated"]
+        ate, std = diff.mean(), diff.std()
+        return ate
+
     def propensity_score(self, data: CausalSetUp):
-        # FIXME: I do not think this is correct implementation
         df = self.data_to_df(data)
         psm = PsmPy(df, treatment="treatment", indx="index", exclude=["outcome"])
+        # TODO: it might be best to create my own psm library since this one has a lot of issues
         try:
             psm.logistic_ps(balance=True)
         except ValueError:
             psm.logistic_ps(balance=False)
-        psm.knn_matched(matcher="propensity_logit", replacement=False)
+        psm.knn_matched(matcher="propensity_score", replacement=True)
         matched = psm.df_matched.merge(df[["outcome", "index"]], on="index")
         if self.outcome_type == "binary":
-            treated = matched[matched["treatment"] == 1]["outcome"]
-            control = matched[matched["treatment"] == 0]["outcome"]
-            ate = treated.mean() - control.mean()
+            pair_diffs = matched[matched["treatment"] == 1]
+            try:
+                pair_diffs["outcome_untreated"] = [
+                    matched[matched["index"] == row["matched_ID"]]["outcome"].iloc[0]
+                    for _, row in pair_diffs.iterrows()
+                ]
+            except IndexError:
+                pair_diffs["outcome_untreated"] = [
+                    matched[matched["matched_ID"] == row["index"]]["outcome"].iloc[0]
+                    for _, row in pair_diffs.iterrows()
+                ]
+            diff = pair_diffs["outcome"] - pair_diffs["outcome_untreated"]
+            ate, std = diff.mean(), diff.std()
             return ate
         elif self.outcome_type == "continuous":
             pass
@@ -154,6 +195,7 @@ class ATEEvaluations:
             + np.random.randn(n_samples)
         )
         self.synth_data = causal_setup
+        self.num_confounders = len(causal_setup.confounders.T)
         return self
 
     def evaluate(self, data: Optional[CausalSetUp] = None):
@@ -164,7 +206,7 @@ class ATEEvaluations:
             "known-effect": self.known_effect,
             "mean-diff": self.mean_diff(data),
             "dml": self.dml(data)[0],
-            "psw": self.propensity_score(data),
+            "psw": self.propensity_score2(data),
             "ipw": self.inverse_prob(data)[0],
         }
         return results_ate
@@ -233,7 +275,7 @@ class ATEEvaluations:
             marker="o",
             linestyle="-",
             color="darkorange",
-            label="psw",
+            label="psm",
         )
         plt.plot(
             confounders,
@@ -253,25 +295,42 @@ class ATEEvaluations:
         # plt.show()
         plt.savefig(f"./exports/eval_coerange{coerange}_ke{ke}_s{sample}.png")
 
-    def export(self): 
+    def export(self):
         pass
 
 
 if __name__ == "__main__":
     ate_eval = ATEEvaluations(seed=47, outcome_type="binary", data=None)
+    coeranges = [2, 4, 8, 16, 32, 64]
+    coeranges = [2, 4, 8, 16, 32, 64, 128, 256]
+    confounders = [i for i in range(3, 20)]
     if False:
-        synth_data = ate_eval.create_synth(
-            n_samples=750, n_confounders=5, known_effect=1.5, coe_range=7
-        ).synth_data
-        diff = ate_eval.mean_diff(synth_data)
-        df = ate_eval.data_to_df()
-        results = ate_eval.evaluate()
+        results = []
+        mean_diffs = []
+        # for coerange in coeranges:
+        for confounder in confounders:
+            synth_data = ate_eval.create_synth(
+                n_samples=1000, n_confounders=confounder, known_effect=4, coe_range=16
+            ).synth_data
+            mean_diffs.append(ate_eval.mean_diff(synth_data))
+            # results.append(ate_eval.propensity_score(synth_data))
+            results.append(ate_eval.dml(synth_data)[0])
+        print([float(round(i, 3)) for i in mean_diffs])
+        print([float(round(i, 3)) for i in results])
     # testing evaluates()
-    confounders = [i for i in range(3, 100)]
-    for coerange in [2, 4, 8, 16, 32, 64, 128, 256]:
-        results = ate_eval.evaluates(
-            confounders=confounders, n_samples=1000, known_effect=4, coe_range=coerange
-        )
-        ate_eval.affichage(results, confounders, coerange=coerange, ke=4, sample=1000)
+    if True:
+        confounders = [i for i in range(3, 100)]
+        coeranges = [64, 128, 256]
+        coeranges = [2, 4, 8, 16, 32, 64, 128, 256]
+        for coerange in coeranges:
+            results = ate_eval.evaluates(
+                confounders=confounders,
+                n_samples=1000,
+                known_effect=4,
+                coe_range=coerange,
+            )
+            ate_eval.affichage(
+                results, confounders, coerange=coerange, ke=4, sample=1000
+            )
 
     print("END")
